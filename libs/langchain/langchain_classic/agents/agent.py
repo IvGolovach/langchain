@@ -50,6 +50,7 @@ from langchain_classic.chains.llm import LLMChain
 from langchain_classic.utilities.asyncio import asyncio_timeout
 
 logger = logging.getLogger(__name__)
+MIN_RUNNABLE_GENERATE_STEPS = 3
 
 
 class BaseSingleActionAgent(BaseModel):
@@ -386,6 +387,53 @@ class MultiActionAgentOutputParser(
         """
 
 
+def _coerce_runnable_output_to_text(output: Any) -> str:
+    """Convert runnable output to text for AgentFinish fallback responses."""
+    if isinstance(output, str):
+        return output
+    if isinstance(output, BaseMessage):
+        content = output.content
+        return content if isinstance(content, str) else str(content)
+    return str(output)
+
+
+def _generate_stopped_response_from_runnable(
+    runnable: Runnable[dict, Any],
+    intermediate_steps: list[tuple[AgentAction, str]],
+    **kwargs: Any,
+) -> AgentFinish | None:
+    """Generate a final answer for runnable agents with string scratchpads."""
+    steps = getattr(runnable, "steps", None)
+    if not isinstance(steps, list) or len(steps) < MIN_RUNNABLE_GENERATE_STEPS:
+        return None
+
+    prepared_inputs = steps[0].invoke(
+        {**kwargs, "intermediate_steps": intermediate_steps},
+    )
+    if not isinstance(prepared_inputs, dict):
+        return None
+
+    scratchpad = prepared_inputs.get("agent_scratchpad")
+    if not isinstance(scratchpad, str):
+        return None
+
+    prepared_inputs["agent_scratchpad"] = (
+        f"{scratchpad}\n\n"
+        "I now need to return a final answer based on the previous steps:"
+    )
+
+    raw_output: Any = prepared_inputs
+    for step in steps[1:-1]:
+        raw_output = step.invoke(raw_output)
+
+    parsed_output = steps[-1].invoke(raw_output)
+    if isinstance(parsed_output, AgentFinish):
+        return parsed_output
+
+    raw_text = _coerce_runnable_output_to_text(raw_output)
+    return AgentFinish({"output": raw_text}, raw_text)
+
+
 class RunnableAgent(BaseSingleActionAgent):
     """Agent powered by Runnables."""
 
@@ -492,6 +540,27 @@ class RunnableAgent(BaseSingleActionAgent):
                 config={"callbacks": callbacks},
             )
         return final_output
+
+    def return_stopped_response(
+        self,
+        early_stopping_method: str,
+        intermediate_steps: list[tuple[AgentAction, str]],
+        **kwargs: Any,
+    ) -> AgentFinish:
+        """Return response when agent execution stops early."""
+        if early_stopping_method == "generate":
+            generated_response = _generate_stopped_response_from_runnable(
+                self.runnable,
+                intermediate_steps,
+                **kwargs,
+            )
+            if generated_response is not None:
+                return generated_response
+        return super().return_stopped_response(
+            early_stopping_method,
+            intermediate_steps,
+            **kwargs,
+        )
 
 
 class RunnableMultiActionAgent(BaseMultiActionAgent):
@@ -605,6 +674,27 @@ class RunnableMultiActionAgent(BaseMultiActionAgent):
             )
 
         return final_output
+
+    def return_stopped_response(
+        self,
+        early_stopping_method: str,
+        intermediate_steps: list[tuple[AgentAction, str]],
+        **kwargs: Any,
+    ) -> AgentFinish:
+        """Return response when agent execution stops early."""
+        if early_stopping_method == "generate":
+            generated_response = _generate_stopped_response_from_runnable(
+                self.runnable,
+                intermediate_steps,
+                **kwargs,
+            )
+            if generated_response is not None:
+                return generated_response
+        return super().return_stopped_response(
+            early_stopping_method,
+            intermediate_steps,
+            **kwargs,
+        )
 
 
 @deprecated(
